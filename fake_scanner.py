@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import webbrowser
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -718,6 +719,37 @@ def service_identity(config: ScannerConfig) -> Dict[str, Any]:
     }
 
 
+def build_dashboard_links(config: ScannerConfig) -> List[Tuple[str, str]]:
+    local_host = "127.0.0.1" if config.host in {"0.0.0.0", "::"} else config.host
+    network_host = advertised_host(config)
+    local_base = f"http://{local_host}:{config.port}"
+    network_base = f"http://{network_host}:{config.port}"
+    links = [
+        ("Dashboard Root (Local)", f"{local_base}/"),
+        ("Status (Local)", f"{local_base}/status"),
+        ("Capabilities (Local)", f"{local_base}/capabilities"),
+        ("Scan PDF (Local)", f"{local_base}/scan?output=pdf"),
+        ("Scan JPEG (Local)", f"{local_base}/scan?output=jpeg"),
+        ("TWAIN Devices (Local)", f"{local_base}/twain/devices"),
+        ("TWAIN Acquire (Local)", f"{local_base}/twain/acquire"),
+        ("WIA Devices (Local)", f"{local_base}/wia/devices"),
+        ("WIA Acquire (Local)", f"{local_base}/wia/acquire"),
+        ("eSCL Capabilities (Local)", f"{local_base}/eSCL/ScannerCapabilities"),
+        ("eSCL ScanJobs (Local)", f"{local_base}/eSCL/ScanJobs"),
+    ]
+    if network_base != local_base:
+        links.extend(
+            [
+                ("Dashboard Root (Network)", f"{network_base}/"),
+                ("Status (Network)", f"{network_base}/status"),
+                ("Scan PDF (Network)", f"{network_base}/scan?output=pdf"),
+                ("TWAIN Devices (Network)", f"{network_base}/twain/devices"),
+                ("WIA Devices (Network)", f"{network_base}/wia/devices"),
+            ]
+        )
+    return links
+
+
 def save_selected_device(config: ScannerConfig) -> None:
     DEFAULT_SELECTION_PATH.write_text(json.dumps(service_identity(config), indent=2), encoding="utf-8")
 
@@ -779,6 +811,265 @@ def run_cli_command(args: argparse.Namespace, config: ScannerConfig) -> int:
     raise SystemExit(f"Unknown command: {args.command}")
 
 
+class FakeScannerUI:
+    def __init__(self, config: ScannerConfig) -> None:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+
+        self.tk = tk
+        self.ttk = ttk
+        self.messagebox = messagebox
+        self.root = tk.Tk()
+        self.root.title("FakeScanner Control Panel")
+        self.root.geometry("1040x720")
+        self.root.minsize(900, 640)
+        self.config = config
+        self.process: Optional[subprocess.Popen[str]] = None
+        self.log_thread: Optional[threading.Thread] = None
+        self.running = False
+        self.state_var = tk.StringVar(value="Stopped")
+        self.health_var = tk.StringVar(value="Unknown")
+        self.local_base_var = tk.StringVar()
+        self.network_base_var = tk.StringVar()
+        self.host_var = tk.StringVar(value=config.host)
+        self.port_var = tk.StringVar(value=str(config.port))
+        self.name_var = tk.StringVar(value=config.scanner_name)
+        self.folder_var = tk.StringVar(value=config.image_folder)
+        self.transforms_var = tk.BooleanVar(value=config.enable_transforms)
+        self.discovery_var = tk.BooleanVar(value=config.enable_discovery)
+        self.link_var = tk.StringVar()
+        self._build_layout()
+        self._refresh_links()
+        self._schedule_status_poll()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_layout(self) -> None:
+        root = self.root
+        ttk = self.ttk
+
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(2, weight=1)
+
+        control = ttk.LabelFrame(root, text="Scanner Controls", padding=12)
+        control.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
+        for index in range(6):
+            control.columnconfigure(index, weight=1)
+
+        ttk.Label(control, text="Host").grid(row=0, column=0, sticky="w")
+        ttk.Entry(control, textvariable=self.host_var).grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        ttk.Label(control, text="Port").grid(row=0, column=1, sticky="w")
+        ttk.Entry(control, textvariable=self.port_var).grid(row=1, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(control, text="Scanner Name").grid(row=0, column=2, sticky="w")
+        ttk.Entry(control, textvariable=self.name_var).grid(row=1, column=2, sticky="ew", padx=(0, 8))
+        ttk.Label(control, text="Image Folder").grid(row=0, column=3, sticky="w")
+        ttk.Entry(control, textvariable=self.folder_var).grid(row=1, column=3, columnspan=2, sticky="ew", padx=(0, 8))
+        ttk.Checkbutton(control, text="Enable Transforms", variable=self.transforms_var, command=self._refresh_links).grid(row=0, column=5, sticky="w")
+        ttk.Checkbutton(control, text="Enable Discovery", variable=self.discovery_var, command=self._refresh_links).grid(row=1, column=5, sticky="w")
+
+        ttk.Button(control, text="Start Server", command=self._start_server).grid(row=2, column=0, pady=(12, 0), sticky="ew")
+        ttk.Button(control, text="Stop Server", command=self._stop_server).grid(row=2, column=1, pady=(12, 0), sticky="ew")
+        ttk.Button(control, text="Refresh Links", command=self._refresh_links).grid(row=2, column=2, pady=(12, 0), sticky="ew")
+        ttk.Button(control, text="Open Root URL", command=self._open_selected_link).grid(row=2, column=3, pady=(12, 0), sticky="ew")
+        ttk.Button(control, text="Copy Selected URL", command=self._copy_selected_link).grid(row=2, column=4, pady=(12, 0), sticky="ew")
+
+        status = ttk.Frame(root, padding=(12, 0, 12, 6))
+        status.grid(row=1, column=0, sticky="ew")
+        status.columnconfigure(3, weight=1)
+        ttk.Label(status, text="Server State:").grid(row=0, column=0, sticky="w")
+        ttk.Label(status, textvariable=self.state_var).grid(row=0, column=1, sticky="w", padx=(4, 16))
+        ttk.Label(status, text="Health:").grid(row=0, column=2, sticky="w")
+        ttk.Label(status, textvariable=self.health_var).grid(row=0, column=3, sticky="w", padx=(4, 16))
+        ttk.Label(status, text="Local Base URL:").grid(row=1, column=0, sticky="w")
+        ttk.Label(status, textvariable=self.local_base_var).grid(row=1, column=1, columnspan=3, sticky="w")
+        ttk.Label(status, text="Network Base URL:").grid(row=2, column=0, sticky="w")
+        ttk.Label(status, textvariable=self.network_base_var).grid(row=2, column=1, columnspan=3, sticky="w")
+
+        body = ttk.Panedwindow(root, orient="horizontal")
+        body.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+
+        links_frame = ttk.LabelFrame(body, text="Copyable Links", padding=8)
+        links_frame.columnconfigure(0, weight=1)
+        links_frame.rowconfigure(0, weight=1)
+        self.links_list = tk.Listbox(links_frame, exportselection=False)
+        self.links_list.grid(row=0, column=0, sticky="nsew")
+        self.links_list.bind("<<ListboxSelect>>", lambda _event: self._update_selected_link())
+        scrollbar = ttk.Scrollbar(links_frame, orient="vertical", command=self.links_list.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.links_list.configure(yscrollcommand=scrollbar.set)
+        ttk.Label(links_frame, textvariable=self.link_var, wraplength=380).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        logs_frame = ttk.LabelFrame(body, text="Server Logs", padding=8)
+        logs_frame.columnconfigure(0, weight=1)
+        logs_frame.rowconfigure(0, weight=1)
+        self.log_text = tk.Text(logs_frame, wrap="word", state="disabled")
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        log_scroll = ttk.Scrollbar(logs_frame, orient="vertical", command=self.log_text.yview)
+        log_scroll.grid(row=0, column=1, sticky="ns")
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+
+        body.add(links_frame, weight=1)
+        body.add(logs_frame, weight=2)
+
+    def _current_config(self) -> ScannerConfig:
+        return ScannerConfig(
+            host=self.host_var.get().strip() or "0.0.0.0",
+            port=int(self.port_var.get().strip() or "80"),
+            scanner_name=self.name_var.get().strip() or "DevScanner Pro",
+            image_folder=self.folder_var.get().strip() or "./images",
+            enable_transforms=self.transforms_var.get(),
+            scan_delay_min=self.config.scan_delay_min,
+            scan_delay_max=self.config.scan_delay_max,
+            manufacturer=self.config.manufacturer,
+            model=self.config.model,
+            driver_platform=self.config.driver_platform,
+            mdns_service_type=self.config.mdns_service_type,
+            mdns_domain=self.config.mdns_domain,
+            enable_discovery=self.discovery_var.get(),
+            config_file=self.config.config_file,
+        )
+
+    def _refresh_links(self) -> None:
+        self.config = self._current_config()
+        links = build_dashboard_links(self.config)
+        self.links_list.delete(0, self.tk.END)
+        for label, url in links:
+            self.links_list.insert(self.tk.END, f"{label}: {url}")
+        if links:
+            self.links_list.selection_clear(0, self.tk.END)
+            self.links_list.selection_set(0)
+            self.links_list.activate(0)
+            self.link_var.set(links[0][1])
+        local_host = "127.0.0.1" if self.config.host in {"0.0.0.0", "::"} else self.config.host
+        self.local_base_var.set(f"http://{local_host}:{self.config.port}")
+        self.network_base_var.set(f"http://{advertised_host(self.config)}:{self.config.port}")
+
+    def _selected_url(self) -> Optional[str]:
+        selection = self.links_list.curselection()
+        if not selection:
+            return None
+        value = self.links_list.get(selection[0])
+        return value.split(": ", 1)[1] if ": " in value else value
+
+    def _update_selected_link(self) -> None:
+        self.link_var.set(self._selected_url() or "")
+
+    def _copy_selected_link(self) -> None:
+        url = self._selected_url()
+        if not url:
+            self.messagebox.showinfo("Copy URL", "Select a link first.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url)
+        self.root.update_idletasks()
+        self.link_var.set(f"Copied: {url}")
+
+    def _open_selected_link(self) -> None:
+        url = self._selected_url()
+        if not url:
+            self.messagebox.showinfo("Open URL", "Select a link first.")
+            return
+        webbrowser.open(url)
+
+    def _append_log(self, message: str) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.insert(self.tk.END, message)
+        self.log_text.see(self.tk.END)
+        self.log_text.configure(state="disabled")
+
+    def _start_server(self) -> None:
+        if self.process and self.process.poll() is None:
+            self.messagebox.showinfo("Server Running", "The server is already running.")
+            return
+        self._refresh_links()
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOST": self.config.host,
+                "PORT": str(self.config.port),
+                "SCANNER_NAME": self.config.scanner_name,
+                "IMAGE_FOLDER": self.config.image_folder,
+                "ENABLE_TRANSFORMS": "true" if self.config.enable_transforms else "false",
+                "ENABLE_DISCOVERY": "true" if self.config.enable_discovery else "false",
+                "SCAN_DELAY_MIN": str(self.config.scan_delay_min),
+                "SCAN_DELAY_MAX": str(self.config.scan_delay_max),
+                "MANUFACTURER": self.config.manufacturer,
+                "MODEL": self.config.model,
+                "DRIVER_PLATFORM": self.config.driver_platform,
+            }
+        )
+        command = [sys.executable, str(Path(__file__).resolve()), "--verbose", "serve"]
+        self.process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            cwd=str(Path(__file__).resolve().parent),
+        )
+        self.running = True
+        self.state_var.set("Starting")
+        self._append_log(f"Starting server with command: {' '.join(command)}\n")
+        self.log_thread = threading.Thread(target=self._drain_logs, daemon=True)
+        self.log_thread.start()
+
+    def _drain_logs(self) -> None:
+        if not self.process or not self.process.stdout:
+            return
+        for line in self.process.stdout:
+            self.root.after(0, self._append_log, line)
+        self.root.after(0, self._handle_process_exit)
+
+    def _handle_process_exit(self) -> None:
+        self.running = False
+        self.state_var.set("Stopped")
+        self.health_var.set("Offline")
+
+    def _stop_server(self) -> None:
+        if not self.process or self.process.poll() is not None:
+            self.state_var.set("Stopped")
+            self.health_var.set("Offline")
+            return
+        self.state_var.set("Stopping")
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+        self.running = False
+        self.state_var.set("Stopped")
+        self.health_var.set("Offline")
+
+    def _schedule_status_poll(self) -> None:
+        self.root.after(1500, self._poll_status)
+
+    def _poll_status(self) -> None:
+        config = self._current_config()
+        status_url = f"http://127.0.0.1:{config.port}/status"
+        try:
+            with urllib.request.urlopen(status_url, timeout=1) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            self.running = True
+            self.state_var.set("Running")
+            self.health_var.set("Healthy" if data.get("healthy") else "Unhealthy")
+        except Exception:  # noqa: BLE001
+            if self.process and self.process.poll() is None:
+                self.state_var.set("Starting")
+                self.health_var.set("Waiting")
+            else:
+                self.state_var.set("Stopped")
+                self.health_var.set("Offline")
+        finally:
+            self._schedule_status_poll()
+
+    def _on_close(self) -> None:
+        self._stop_server()
+        self.root.destroy()
+
+    def run(self) -> int:
+        self.root.mainloop()
+        return 0
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fake network scanner for local development and testing")
     parser.add_argument("--config", dest="config_file", default=None, help="Optional JSON config file")
@@ -786,6 +1077,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("serve", help="Run the scanner HTTP service")
+    subparsers.add_parser("ui", help="Launch the desktop control panel UI")
     subparsers.add_parser("list-devices", help="List discoverable fake scanner devices")
     subparsers.add_parser("twain-list-sources", help="List simulated TWAIN sources")
     subparsers.add_parser("wia-list-devices", help="List simulated WIA devices")
@@ -893,6 +1185,14 @@ def serve(config: ScannerConfig, verbose: bool) -> int:
             LOGGER.info("Server stopped")
 
 
+def run_ui(config: ScannerConfig) -> int:
+    try:
+        ui = FakeScannerUI(config)
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"Unable to start UI mode: {exc}") from exc
+    return ui.run()
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -900,6 +1200,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.command == "serve":
         return serve(config, args.verbose)
+    if args.command == "ui":
+        return run_ui(config)
 
     configure_logging(args.verbose)
     return run_cli_command(args, config)

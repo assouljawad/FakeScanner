@@ -10,6 +10,7 @@ A production-quality fake scanner for Windows development and testing.
 - Exposes both simple REST endpoints and eSCL / AirScan-style endpoints.
 - Advertises itself over Bonjour / mDNS when Bonjour `dns-sd` is installed on Windows or macOS.
 - Includes TWAIN-like and WIA-like HTTP/CLI simulations for discovery and acquisition workflows.
+- Includes a built-in desktop control panel UI so you can start/stop the server, monitor state, and copy links without using the terminal.
 - Auto-generates a demo PDF at startup when `./images` is empty, so the repo can stay text-only.
 - Watches the source folder continuously and handles empty folders gracefully.
 
@@ -51,6 +52,12 @@ Default run on port 80:
 
 ```bash
 python3 fake_scanner.py serve
+```
+
+Launch the desktop UI:
+
+```bash
+python3 fake_scanner.py ui
 ```
 
 On Windows, use a non-privileged test port unless you specifically need port `80`:
@@ -112,6 +119,8 @@ python3 fake_scanner.py --config scanner_config.json serve
 - `GET /capabilities`
 - `GET /scan?output=jpeg`
 - `GET /scan?output=pdf`
+
+The desktop UI shows these links, lets you copy them to the clipboard, and gives you live server state.
 
 ### TWAIN / WIA simulation
 
@@ -228,6 +237,25 @@ python3 fake_scanner.py twain-acquire --output-format pdf
 python3 fake_scanner.py wia-acquire --output-format pdf
 ```
 
+## Desktop control panel UI
+
+Start the UI:
+
+```bash
+python3 fake_scanner.py ui
+```
+
+The UI lets you:
+
+- edit host, port, scanner name, and image folder
+- toggle transforms and discovery
+- start and stop the scanner
+- see current server state and health
+- view local and network base URLs
+- browse all important links in one place
+- copy any selected URL with one click
+- watch live server logs
+
 ## Notes
 
 - The server is built on `ThreadingHTTPServer`, so it can handle concurrent requests.
@@ -237,3 +265,4 @@ python3 fake_scanner.py wia-acquire --output-format pdf
 - Optional transforms are scan-like and best-effort. Rotation uses `sips` when available; grayscale/blur are applied only if ImageMagick is present.
 - Bonjour advertisement works when the Bonjour `dns-sd` utility is installed; if it is not installed, the server still runs and logs a warning.
 - No sample binary assets are committed, which keeps Codex PR creation compatible with text-only diffs while still giving you a startup document automatically.
+- The UI uses Tkinter from Python's standard library, so it should work anywhere Tk is available.
