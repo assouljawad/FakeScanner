@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Production-quality fake scanner for local macOS development and testing.
+"""Production-quality fake scanner for local Windows development and testing.
 
 This script provides:
 - A threaded HTTP server with REST and eSCL-like endpoints.
 - Random document selection from a watched images folder.
 - Optional scan-like transformations for raster images.
-- Bonjour / mDNS advertisement via the built-in macOS `dns-sd` utility.
-- A TWAIN-like CLI bridge for list/select/acquire flows.
+- Bonjour / mDNS advertisement when Bonjour is installed (`dns-sd` on Windows/macOS).
+- TWAIN-like and WIA-like HTTP/CLI bridges for list/select/acquire flows.
 
-Primary runtime target: macOS.
+Primary runtime target: Windows.
 No third-party Python packages are required.
 """
 from __future__ import annotations
@@ -56,8 +56,10 @@ class ScannerConfig:
     scan_delay_max: float = 3.0
     manufacturer: str = "DevLab Imaging"
     model: str = "ScanSim 2000"
+    driver_platform: str = "WIA/TWAIN"
     mdns_service_type: str = "_uscan._tcp"
     mdns_domain: str = "local"
+    enable_discovery: bool = True
     config_file: Optional[str] = None
 
     @classmethod
@@ -82,8 +84,10 @@ class ScannerConfig:
             scan_delay_max=float(get_value("SCAN_DELAY_MAX", cls.scan_delay_max)),
             manufacturer=str(get_value("MANUFACTURER", cls.manufacturer)),
             model=str(get_value("MODEL", cls.model)),
+            driver_platform=str(get_value("DRIVER_PLATFORM", cls.driver_platform)),
             mdns_service_type=str(get_value("MDNS_SERVICE_TYPE", cls.mdns_service_type)),
             mdns_domain=str(get_value("MDNS_DOMAIN", cls.mdns_domain)),
+            enable_discovery=str(get_value("ENABLE_DISCOVERY", cls.enable_discovery)).lower() in {"1", "true", "yes", "on"},
             config_file=chosen_file,
         )
 
@@ -185,19 +189,19 @@ class ImageRepository:
 
 
 class BonjourBroadcaster:
-    """Publishes Bonjour metadata using macOS's built-in dns-sd utility."""
+    """Publishes Bonjour metadata when Bonjour's dns-sd utility is available."""
 
     def __init__(self, config: ScannerConfig) -> None:
         self.config = config
         self._process: Optional[subprocess.Popen[str]] = None
 
     def start(self) -> None:
-        if sys.platform != "darwin":
-            LOGGER.warning("Bonjour advertisement is only available on macOS; skipping on %s", sys.platform)
+        if not self.config.enable_discovery:
+            LOGGER.info("Network discovery disabled by configuration")
             return
-        dns_sd = shutil.which("dns-sd")
+        dns_sd = shutil.which("dns-sd") or shutil.which("dns-sd.exe")
         if dns_sd is None:
-            LOGGER.warning("dns-sd not found; skipping Bonjour advertisement")
+            LOGGER.warning("Bonjour dns-sd utility not found; skipping discovery advertisement")
             return
         cmd = [
             dns_sd,
@@ -334,6 +338,7 @@ class ScannerService:
             "scanner_name": self.config.scanner_name,
             "manufacturer": self.config.manufacturer,
             "model": self.config.model,
+            "driver_platform": self.config.driver_platform,
             "host": self.config.host,
             "port": self.config.port,
             "image_folder": str(self.repository.folder),
@@ -348,7 +353,8 @@ class ScannerService:
                 "name": self.config.scanner_name,
                 "manufacturer": self.config.manufacturer,
                 "model": self.config.model,
-                "protocols": ["rest", "escl", "twain-like-cli"],
+                "driver_platform": self.config.driver_platform,
+                "protocols": ["rest", "escl", "twain-like-cli", "wia-like-http"],
             },
             "formats": ["jpeg", "pdf"],
             "color_modes": ["color", "grayscale"],
@@ -356,6 +362,57 @@ class ScannerService:
             "source": "flatbed",
             "adf": False,
             "folder_watch_enabled": True,
+        }
+
+    def device_descriptor(self) -> Dict[str, Any]:
+        return {
+            "device_id": f"{self.config.scanner_name.lower().replace(' ', '-')}-{self.config.port}",
+            "name": self.config.scanner_name,
+            "manufacturer": self.config.manufacturer,
+            "model": self.config.model,
+            "driver_platform": self.config.driver_platform,
+            "transport": "http",
+            "host": advertised_host(self.config),
+            "port": self.config.port,
+            "formats": ["jpeg", "pdf"],
+            "sources": ["flatbed"],
+        }
+
+    def twain_payload(self) -> Dict[str, Any]:
+        device = self.device_descriptor()
+        return {
+            "twain": {
+                "default_source": device["device_id"],
+                "sources": [
+                    {
+                        **device,
+                        "source_name": self.config.scanner_name,
+                        "twain_state": 4,
+                        "supports_native_transfer": False,
+                        "supports_file_transfer": True,
+                    }
+                ],
+            }
+        }
+
+    def wia_payload(self) -> Dict[str, Any]:
+        device = self.device_descriptor()
+        return {
+            "wia": {
+                "default_device_id": device["device_id"],
+                "devices": [
+                    {
+                        **device,
+                        "wia_item_type": "ScannerDevice",
+                        "properties": {
+                            "Horizontal Resolution": 300,
+                            "Vertical Resolution": 300,
+                            "Current Intent": "ImageTypeColor",
+                            "Document Handling Select": "FEEDER_DISABLED",
+                        },
+                    }
+                ],
+            }
         }
 
     def perform_scan(self, output_format: str) -> Tuple[bytes, str, ScanJob]:
@@ -447,10 +504,18 @@ class ScannerHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._handle_status()
             elif self.command == "GET" and parsed.path == "/capabilities":
                 self._handle_capabilities()
+            elif self.command == "GET" and parsed.path == "/twain/devices":
+                self._handle_twain_devices()
+            elif self.command == "GET" and parsed.path == "/wia/devices":
+                self._handle_wia_devices()
             elif self.command == "GET" and parsed.path == "/scan":
                 self._handle_scan(parsed.query)
             elif self.command == "GET" and parsed.path == "/eSCL/ScannerCapabilities":
                 self._handle_escl_capabilities()
+            elif self.command == "POST" and parsed.path == "/twain/acquire":
+                self._handle_twain_acquire()
+            elif self.command == "POST" and parsed.path == "/wia/acquire":
+                self._handle_wia_acquire()
             elif self.command == "POST" and parsed.path == "/eSCL/ScanJobs":
                 self._handle_escl_scan_job()
             elif self.command == "GET" and parsed.path.startswith("/eSCL/ScanJobs/") and parsed.path.endswith("/NextDocument"):
@@ -473,6 +538,10 @@ class ScannerHTTPRequestHandler(BaseHTTPRequestHandler):
                 "status_url": "/status",
                 "capabilities_url": "/capabilities",
                 "scan_url": "/scan",
+                "twain_devices_url": "/twain/devices",
+                "twain_acquire_url": "/twain/acquire",
+                "wia_devices_url": "/wia/devices",
+                "wia_acquire_url": "/wia/acquire",
                 "escl_capabilities_url": "/eSCL/ScannerCapabilities",
             },
         )
@@ -482,6 +551,12 @@ class ScannerHTTPRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_capabilities(self) -> None:
         self._send_json(HTTPStatus.OK, self.scanner_service.capabilities_payload())
+
+    def _handle_twain_devices(self) -> None:
+        self._send_json(HTTPStatus.OK, self.scanner_service.twain_payload())
+
+    def _handle_wia_devices(self) -> None:
+        self._send_json(HTTPStatus.OK, self.scanner_service.wia_payload())
 
     def _handle_scan(self, query: str) -> None:
         params = urllib.parse.parse_qs(query)
@@ -505,6 +580,51 @@ class ScannerHTTPRequestHandler(BaseHTTPRequestHandler):
         SubElement(root, "scan:ColorModes")
         xml_payload = tostring(root, encoding="utf-8", xml_declaration=True)
         self._send_bytes(HTTPStatus.OK, xml_payload, "application/xml")
+
+    def _read_json_body(self) -> Dict[str, Any]:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length <= 0:
+            return {}
+        raw_body = self.rfile.read(content_length)
+        if not raw_body:
+            return {}
+        try:
+            return json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ScannerError(HTTPStatus.BAD_REQUEST, f"Invalid JSON body: {exc}") from exc
+
+    def _handle_twain_acquire(self) -> None:
+        payload = self._read_json_body()
+        output_format = str(payload.get("output_format", "pdf")).lower()
+        document, mime_type, job = self.scanner_service.perform_scan(output_format)
+        response = {
+            "protocol": "twain",
+            "job_id": job.job_id,
+            "device": self.scanner_service.device_descriptor(),
+            "output_format": output_format,
+            "mime_type": mime_type,
+            "size_bytes": len(document),
+            "source_file": job.source_file,
+            "download_url": f"/scan?output={output_format}",
+        }
+        self._send_json(HTTPStatus.OK, response)
+
+    def _handle_wia_acquire(self) -> None:
+        payload = self._read_json_body()
+        output_format = str(payload.get("output_format", "pdf")).lower()
+        document, mime_type, job = self.scanner_service.perform_scan(output_format)
+        response = {
+            "protocol": "wia",
+            "job_id": job.job_id,
+            "device": self.scanner_service.device_descriptor(),
+            "item_name": job.source_file,
+            "output_format": output_format,
+            "mime_type": mime_type,
+            "size_bytes": len(document),
+            "transfer_mode": "file",
+            "download_url": f"/scan?output={output_format}",
+        }
+        self._send_json(HTTPStatus.OK, response)
 
     def _handle_escl_scan_job(self) -> None:
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -612,9 +732,19 @@ def run_cli_command(args: argparse.Namespace, config: ScannerConfig) -> int:
     if args.command == "list-devices":
         print(json.dumps({"devices": [service_identity(config)]}, indent=2))
         return 0
+    if args.command == "twain-list-sources":
+        print(json.dumps({"sources": [service_identity(config) | {"driver": "TWAIN"}]}, indent=2))
+        return 0
+    if args.command == "wia-list-devices":
+        print(json.dumps({"devices": [service_identity(config) | {"driver": "WIA"}]}, indent=2))
+        return 0
     if args.command == "select-device":
         save_selected_device(config)
         print(f"Selected device: {config.scanner_name}")
+        return 0
+    if args.command == "twain-select-source":
+        save_selected_device(config)
+        print(f"Selected TWAIN source: {config.scanner_name}")
         return 0
     if args.command == "acquire-image":
         selected = load_selected_device() or service_identity(config)
@@ -629,6 +759,23 @@ def run_cli_command(args: argparse.Namespace, config: ScannerConfig) -> int:
         output_path.write_bytes(payload)
         print(f"Saved scan to {output_path}")
         return 0
+    if args.command in {"twain-acquire", "wia-acquire"}:
+        selected = load_selected_device() or service_identity(config)
+        endpoint = "twain/acquire" if args.command == "twain-acquire" else "wia/acquire"
+        request_payload = json.dumps({"output_format": args.output_format}).encode("utf-8")
+        request = urllib.request.Request(
+            f"{selected['base_url']}/{endpoint}",
+            data=request_payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=args.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            raise SystemExit(f"Failed to acquire image metadata from {request.full_url}: {exc}") from exc
+        print(json.dumps(payload, indent=2))
+        return 0
     raise SystemExit(f"Unknown command: {args.command}")
 
 
@@ -640,11 +787,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("serve", help="Run the scanner HTTP service")
     subparsers.add_parser("list-devices", help="List discoverable fake scanner devices")
+    subparsers.add_parser("twain-list-sources", help="List simulated TWAIN sources")
+    subparsers.add_parser("wia-list-devices", help="List simulated WIA devices")
     subparsers.add_parser("select-device", help="Select the local fake scanner device")
+    subparsers.add_parser("twain-select-source", help="Select the local fake scanner as the TWAIN source")
     acquire = subparsers.add_parser("acquire-image", help="Acquire an image through the local scanner API")
     acquire.add_argument("--output", required=True, help="Output file path")
     acquire.add_argument("--output-format", choices=["jpeg", "pdf"], default="jpeg")
     acquire.add_argument("--timeout", type=int, default=15)
+    twain_acquire = subparsers.add_parser("twain-acquire", help="Acquire scan metadata through the simulated TWAIN bridge")
+    twain_acquire.add_argument("--output-format", choices=["jpeg", "pdf"], default="pdf")
+    twain_acquire.add_argument("--timeout", type=int, default=15)
+    wia_acquire = subparsers.add_parser("wia-acquire", help="Acquire scan metadata through the simulated WIA bridge")
+    wia_acquire.add_argument("--output-format", choices=["jpeg", "pdf"], default="pdf")
+    wia_acquire.add_argument("--timeout", type=int, default=15)
     return parser
 
 

@@ -1,6 +1,6 @@
 # FakeScanner
 
-A production-quality fake scanner for macOS development and testing.
+A production-quality fake scanner for Windows development and testing.
 
 ## What it does
 
@@ -8,8 +8,8 @@ A production-quality fake scanner for macOS development and testing.
 - Binds to a configurable IP and port, with defaults of `0.0.0.0:80`.
 - Serves realistic scan results from files stored in `./images`.
 - Exposes both simple REST endpoints and eSCL / AirScan-style endpoints.
-- Advertises itself over Bonjour / mDNS using macOS's built-in `dns-sd` tool.
-- Includes a TWAIN-like CLI simulation for `list-devices`, `select-device`, and `acquire-image`.
+- Advertises itself over Bonjour / mDNS when Bonjour `dns-sd` is installed on Windows or macOS.
+- Includes TWAIN-like and WIA-like HTTP/CLI simulations for discovery and acquisition workflows.
 - Auto-generates a demo PDF at startup when `./images` is empty, so the repo can stay text-only.
 - Watches the source folder continuously and handles empty folders gracefully.
 
@@ -43,6 +43,8 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
+Primary runtime target: Windows. You can also run it on macOS or Linux, but the Windows workflow is the main one now.
+
 ## Run
 
 Default run on port 80:
@@ -51,7 +53,7 @@ Default run on port 80:
 python3 fake_scanner.py serve
 ```
 
-On macOS, binding to port `80` usually requires elevated privileges. For local testing on a non-privileged port:
+On Windows, use a non-privileged test port unless you specifically need port `80`:
 
 ```bash
 PORT=8080 python3 fake_scanner.py serve
@@ -72,8 +74,10 @@ Set configuration via environment variables or an optional JSON config file.
 - `SCAN_DELAY_MAX` — default `3.0`
 - `MANUFACTURER` — default `DevLab Imaging`
 - `MODEL` — default `ScanSim 2000`
+- `DRIVER_PLATFORM` — default `WIA/TWAIN`
 - `MDNS_SERVICE_TYPE` — default `_uscan._tcp`
 - `MDNS_DOMAIN` — default `local`
+- `ENABLE_DISCOVERY` — default `true`
 - `CONFIG_FILE` — optional JSON config file
 
 ### Example config file
@@ -88,7 +92,9 @@ Set configuration via environment variables or an optional JSON config file.
   "scan_delay_min": 1.0,
   "scan_delay_max": 3.0,
   "manufacturer": "DevLab Imaging",
-  "model": "ScanSim 2000"
+  "model": "ScanSim 2000",
+  "driver_platform": "WIA/TWAIN",
+  "enable_discovery": true
 }
 ```
 
@@ -106,6 +112,13 @@ python3 fake_scanner.py --config scanner_config.json serve
 - `GET /capabilities`
 - `GET /scan?output=jpeg`
 - `GET /scan?output=pdf`
+
+### TWAIN / WIA simulation
+
+- `GET /twain/devices`
+- `POST /twain/acquire`
+- `GET /wia/devices`
+- `POST /wia/acquire`
 
 ### eSCL-like
 
@@ -132,6 +145,8 @@ Check capabilities:
 ```bash
 curl http://127.0.0.1:8080/capabilities
 curl http://127.0.0.1:8080/eSCL/ScannerCapabilities
+curl http://127.0.0.1:8080/twain/devices
+curl http://127.0.0.1:8080/wia/devices
 ```
 
 Request a scan:
@@ -151,7 +166,23 @@ curl -i -X POST http://127.0.0.1:8080/eSCL/ScanJobs \
 curl -o scan-from-escl.pdf http://127.0.0.1:8080/eSCL/ScanJobs/<job_id>/NextDocument
 ```
 
-## TWAIN-like CLI bridge
+TWAIN acquire metadata:
+
+```bash
+curl -X POST http://127.0.0.1:8080/twain/acquire \
+  -H 'Content-Type: application/json' \
+  -d '{"output_format":"pdf"}'
+```
+
+WIA acquire metadata:
+
+```bash
+curl -X POST http://127.0.0.1:8080/wia/acquire \
+  -H 'Content-Type: application/json' \
+  -d '{"output_format":"pdf"}'
+```
+
+## TWAIN / WIA CLI bridge
 
 List devices:
 
@@ -159,10 +190,28 @@ List devices:
 python3 fake_scanner.py list-devices
 ```
 
+List simulated TWAIN sources:
+
+```bash
+python3 fake_scanner.py twain-list-sources
+```
+
+List simulated WIA devices:
+
+```bash
+python3 fake_scanner.py wia-list-devices
+```
+
 Select the local device:
 
 ```bash
 python3 fake_scanner.py select-device
+```
+
+Select the TWAIN source:
+
+```bash
+python3 fake_scanner.py twain-select-source
 ```
 
 Acquire a scan through the local API:
@@ -172,12 +221,19 @@ python3 fake_scanner.py acquire-image --output ./output/scan.jpg --output-format
 python3 fake_scanner.py acquire-image --output ./output/scan.pdf --output-format pdf
 ```
 
+Acquire through the simulated TWAIN / WIA bridges:
+
+```bash
+python3 fake_scanner.py twain-acquire --output-format pdf
+python3 fake_scanner.py wia-acquire --output-format pdf
+```
+
 ## Notes
 
 - The server is built on `ThreadingHTTPServer`, so it can handle concurrent requests.
 - If `./images` is empty when the server starts, it seeds the folder with a demo PDF automatically; if there are still no compatible documents for a requested format, the scan endpoints return a structured `503` response instead of crashing.
 - JPEG output uses raster files only.
-- PDF output can come directly from a source PDF or be generated from a raster file using macOS `sips`.
-- Optional transforms are scan-like and best-effort. Rotation uses built-in macOS tooling; grayscale/blur are applied only if ImageMagick is present.
-- Bonjour advertisement is available on macOS through the built-in `dns-sd` command.
+- PDF output can come directly from a source PDF or be generated from a raster file using `sips` when available.
+- Optional transforms are scan-like and best-effort. Rotation uses `sips` when available; grayscale/blur are applied only if ImageMagick is present.
+- Bonjour advertisement works when the Bonjour `dns-sd` utility is installed; if it is not installed, the server still runs and logs a warning.
 - No sample binary assets are committed, which keeps Codex PR creation compatible with text-only diffs while still giving you a startup document automatically.
