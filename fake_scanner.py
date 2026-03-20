@@ -845,6 +845,7 @@ class FakeScannerUI:
 
     def _build_layout(self) -> None:
         root = self.root
+        tk = self.tk
         ttk = self.ttk
 
         root.columnconfigure(0, weight=1)
