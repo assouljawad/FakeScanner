@@ -17,6 +17,10 @@ A production-quality fake scanner for Windows development and testing.
 ## Files
 
 - `fake_scanner.py` — main script
+- `launch_fake_scanner_ui.pyw` — windowed launcher entry point for Windows packaging
+- `packaging/fake_scanner_ui.spec` — PyInstaller spec for building `FakeScanner.exe`
+- `packaging/FakeScannerInstaller.iss` — Inno Setup script for producing an installer
+- `scripts/build_windows_app.ps1` — PowerShell build script for the Windows app/installer
 - `requirements.txt` — dependency note
 
 ## Supported source files
@@ -58,6 +62,12 @@ Launch the desktop UI:
 
 ```bash
 python3 fake_scanner.py ui
+```
+
+Launch the windowed entry point directly on Windows:
+
+```bash
+pythonw.exe launch_fake_scanner_ui.pyw
 ```
 
 On Windows, use a non-privileged test port unless you specifically need port `80`:
@@ -256,6 +266,41 @@ The UI lets you:
 - copy any selected URL with one click
 - watch live server logs
 
+## Build an installable Windows app
+
+This repo now includes packaging assets so you can build a real Windows desktop app and installer.
+
+### What gets built
+
+- `dist\FakeScanner\FakeScanner.exe` — PyInstaller-built desktop app
+- `dist\installer\FakeScannerSetup.exe` — Inno Setup installer
+
+### Prerequisites
+
+- Windows with Python 3
+- `py` launcher available
+- Inno Setup 6 installed if you want the installer step
+
+### Build commands
+
+Run the PowerShell build script:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_app.ps1
+```
+
+Build only the `.exe` and skip the installer:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_app.ps1 -SkipInstaller
+```
+
+### Packaging files
+
+- `launch_fake_scanner_ui.pyw` starts the Tk UI without a console window.
+- `packaging/fake_scanner_ui.spec` tells PyInstaller how to bundle the app.
+- `packaging/FakeScannerInstaller.iss` creates a normal Windows installer with Start Menu and optional desktop shortcuts.
+
 ## Notes
 
 - The server is built on `ThreadingHTTPServer`, so it can handle concurrent requests.
@@ -266,3 +311,4 @@ The UI lets you:
 - Bonjour advertisement works when the Bonjour `dns-sd` utility is installed; if it is not installed, the server still runs and logs a warning.
 - No sample binary assets are committed, which keeps Codex PR creation compatible with text-only diffs while still giving you a startup document automatically.
 - The UI uses Tkinter from Python's standard library, so it should work anywhere Tk is available.
+- The Windows packaging flow uses PyInstaller for the app bundle and Inno Setup for the installer.

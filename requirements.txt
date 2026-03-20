@@ -1,2 +1,3 @@
 # No third-party Python dependencies are required.
 # The scanner uses Python's standard library and optionally integrates with `dns-sd`, `sips`, and/or ImageMagick when available.
+# Windows packaging is handled separately through PyInstaller and Inno Setup via scripts/build_windows_app.ps1.
